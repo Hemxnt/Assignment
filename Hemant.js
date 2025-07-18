@@ -1,79 +1,147 @@
 const http = require('http');
 const https = require('https');
 
-const TARGET_URL = 'https://time.com';
 const PORT = 3000;
+const TIME_URL = 'https://time.com';
 
-/**
- * Fetches the latest stories from Time.com by parsing the HTML.
- * Uses only built-in string operations—no external libraries.
- * @param {Function} callback - Receives (error, storiesArray)
- */
-
-function fetchStories(callback) {
-  https.get(TARGET_URL, (res) => {
-    let html = '';
-    res.on('data', chunk => {
-      html += chunk;
-    });
-    res.on('end', () => {
-      try {
-        const stories = [];
-        // Split on <h3 to target headline blocks
-        const parts = html.split('<h3');
-        for (let i = 1; i < parts.length && stories.length < 6; i++) {
-          const block = parts[i];
-          const aTagStart = block.indexOf('<a ');
-          if (aTagStart === -1) continue;
-
-          // Extract href
-          const hrefKey = 'href="';
-          const hrefIndex = block.indexOf(hrefKey, aTagStart);
-          if (hrefIndex === -1) continue;
-          const linkStart = hrefIndex + hrefKey.length;
-          const linkEnd = block.indexOf('"', linkStart);
-          let link = block.substring(linkStart, linkEnd);
-          // Normalize relative URLs
-          if (link.startsWith('/')) link = TARGET_URL + link;
-
-          // Extract link text (title)
-          const titleStart = block.indexOf('>', linkEnd) + 1;
-          const titleEnd = block.indexOf('</a>', titleStart);
-          let title = block.substring(titleStart, titleEnd).trim();
-          // Remove any remaining HTML tags/entities
-          title = title.replace(/<[^>]+>/g, '');
-
-          stories.push({ title, link });
+function fetchTimeStories(callback) {
+    const options = {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
+    };
 
-        callback(null, stories);
-      } catch (parseErr) {
-        callback(parseErr);
-      }
+    https.get(TIME_URL, options, (res) => {
+        let data = '';
+
+        res.on('data', (chunk) => {
+            data += chunk;
+        });
+
+        res.on('end', () => {
+            const stories = extractStories(data);
+            callback(null, stories);
+        });
+    }).on('error', (err) => {
+        callback(err, null);
     });
-  }).on('error', (err) => {
-    callback(err);
-  });
 }
 
-//server
+function cleanHtml(str) {
+    // Remove HTML tags
+    str = str.replace(/<[^>]+>/g, '');
+    
+    // Replace common HTML entities
+    const entities = {
+        '&amp;': '&',
+        '&lt;': '<',
+        '&gt;': '>',
+        '&quot;': '"',
+        '&#39;': "'",
+        '&nbsp;': ' '
+    };
+    
+    for (let entity in entities) {
+        str = str.replace(new RegExp(entity, 'g'), entities[entity]);
+    }
+    
+    return str.trim();
+}
+
+function isValidStory(link) {
+    // Exclude section links
+    if (link.includes('/section/')) return false;
+    
+    // Exclude non-article pages
+    const invalidPaths = ['/author/', '/tag/', '/category/', '/video/'];
+    return !invalidPaths.some(path => link.includes(path));
+}
+
+function extractStories(html) {
+    const stories = [];
+    let currentIndex = 0;
+
+    // Look for the latest stories section
+    while (stories.length < 6 && currentIndex < html.length) {
+        // Look for article elements
+        const articleStart = html.indexOf('<article', currentIndex);
+        if (articleStart === -1) break;
+        
+        const articleEnd = html.indexOf('</article>', articleStart);
+        if (articleEnd === -1) break;
+
+        const article = html.substring(articleStart, articleEnd);
+        
+        // Look for anchor tag with headline class
+        const anchorStart = article.indexOf('<a');
+        if (anchorStart !== -1) {
+            // Extract href
+            const hrefStart = article.indexOf('href="', anchorStart);
+            if (hrefStart !== -1) {
+                const hrefEnd = article.indexOf('"', hrefStart + 6);
+                if (hrefEnd !== -1) {
+                    let link = article.substring(hrefStart + 6, hrefEnd);
+                    
+                    // Ensure link starts with https://time.com
+                    if (!link.startsWith('https://time.com')) {
+                        if (link.startsWith('/')) {
+                            link = 'https://time.com' + link;
+                        } else {
+                            currentIndex = articleEnd + 1;
+                            continue;
+                        }
+                    }
+
+                    // Skip if not a valid story
+                    if (!isValidStory(link)) {
+                        currentIndex = articleEnd + 1;
+                        continue;
+                    }
+
+                    // Look for headline text
+                    const headlineStart = article.indexOf('>', hrefEnd) + 1;
+                    if (headlineStart !== 0) {
+                        const headlineEnd = article.indexOf('</a>', headlineStart);
+                        if (headlineEnd !== -1) {
+                            let title = article.substring(headlineStart, headlineEnd).trim();
+                            title = cleanHtml(title);
+                            
+                            // Only add if we have both title and link and it's not a duplicate
+                            if (title && title.length > 5 && link && !stories.some(story => story.title === title)) {
+                                stories.push({ title, link });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        currentIndex = articleEnd + 1;
+    }
+
+    return stories.slice(0, 6);
+}
+
 const server = http.createServer((req, res) => {
-  if (req.method === 'GET' && req.url === '/getTimeStories') {
-    fetchStories((err, stories) => {
-      if (err) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(stories));
-      }
-    });
-  } else {
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('Not Found');
-  }
+    if (req.url === '/getTimeStories' && req.method === 'GET') {
+        fetchTimeStories((err, stories) => {
+            res.setHeader('Content-Type', 'application/json');
+            
+            if (err) {
+                res.statusCode = 500;
+                res.end(JSON.stringify({ error: 'Failed to fetch stories' }));
+                return;
+            }
+
+            res.statusCode = 200;
+            res.end(JSON.stringify(stories));
+        });
+    } else {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ error: 'Not found' }));
+    }
 });
 
 server.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+    console.log(`Server running at http://localhost:${PORT}`);
 });
